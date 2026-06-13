@@ -1,0 +1,181 @@
+name: Toooony Store Publish
+description: Upload an Android package to Toooony backend and publish or update an internal Store release.
+
+inputs:
+  backend-url:
+    description: Base URL of tbe_go, for example https://api.toooony.cn
+    required: true
+  backend-token:
+    description: Toooony Access Token with store:publish scope
+    required: true
+  package-file:
+    description: APK/APKS/XAPK file path
+    required: true
+  package-name:
+    description: Optional package name override
+    required: false
+    default: ""
+  app-name:
+    description: Optional app display name override
+    required: false
+    default: ""
+  activity-name:
+    description: Optional Launcher catalog activity name
+    required: false
+    default: ""
+  version-name:
+    description: Optional version name override
+    required: false
+    default: ""
+  version-code:
+    description: Optional version code override
+    required: false
+    default: ""
+  platform:
+    description: Release platform
+    required: false
+    default: android
+  architecture:
+    description: Optional ABI or architecture override, for example arm64-v8a
+    required: false
+    default: ""
+  artifact-type:
+    description: Artifact type, usually apk
+    required: false
+    default: apk
+  notes:
+    description: Optional release notes
+    required: false
+    default: ""
+  is-active:
+    description: Whether the Store release is active
+    required: false
+    default: "true"
+  update-catalog:
+    description: Whether to create or update Launcher catalog entry
+    required: false
+    default: "true"
+  catalog-enabled:
+    description: Whether the catalog entry is visible/enabled
+    required: false
+    default: "true"
+  download-region:
+    description: Region key for legacy catalog download URL
+    required: false
+    default: global
+
+outputs:
+  response-file:
+    description: Path to the backend JSON response body
+    value: ${{ steps.publish.outputs['response-file'] }}
+  release-id:
+    description: Store release ID returned by backend, when parseable
+    value: ${{ steps.publish.outputs['release-id'] }}
+
+runs:
+  using: composite
+  steps:
+    - id: publish
+      shell: bash
+      env:
+        BACKEND_URL: ${{ inputs.backend-url }}
+        BACKEND_TOKEN: ${{ inputs.backend-token }}
+        PACKAGE_FILE: ${{ inputs.package-file }}
+        PACKAGE_NAME: ${{ inputs.package-name }}
+        APP_NAME: ${{ inputs.app-name }}
+        ACTIVITY_NAME: ${{ inputs.activity-name }}
+        VERSION_NAME: ${{ inputs.version-name }}
+        VERSION_CODE: ${{ inputs.version-code }}
+        PLATFORM: ${{ inputs.platform }}
+        ARCHITECTURE: ${{ inputs.architecture }}
+        ARTIFACT_TYPE: ${{ inputs.artifact-type }}
+        NOTES: ${{ inputs.notes }}
+        IS_ACTIVE: ${{ inputs.is-active }}
+        UPDATE_CATALOG: ${{ inputs.update-catalog }}
+        CATALOG_ENABLED: ${{ inputs.catalog-enabled }}
+        DOWNLOAD_REGION: ${{ inputs.download-region }}
+      run: |
+        set -euo pipefail
+
+        if [ ! -f "$PACKAGE_FILE" ]; then
+          echo "Package file not found: $PACKAGE_FILE" >&2
+          exit 1
+        fi
+        if [ -z "${BACKEND_URL:-}" ]; then
+          echo "backend-url is required" >&2
+          exit 1
+        fi
+        if [ -z "${BACKEND_TOKEN:-}" ]; then
+          echo "backend-token is required" >&2
+          exit 1
+        fi
+
+        backend="${BACKEND_URL%/}"
+        url="${backend}/api/v1/admin/store/packages/publish/cicd"
+        response_file="${RUNNER_TEMP:-.}/toooony-store-publish-response.json"
+
+        args=(
+          -sS
+          -L
+          --post301
+          --post302
+          --post303
+          -X POST "$url"
+          -H "Authorization: Bearer ${BACKEND_TOKEN}"
+          -F "file=@${PACKAGE_FILE}"
+          -F "platform=${PLATFORM}"
+          -F "artifactType=${ARTIFACT_TYPE}"
+          -F "isActive=${IS_ACTIVE}"
+          -F "updateCatalog=${UPDATE_CATALOG}"
+          -F "catalogEnabled=${CATALOG_ENABLED}"
+          -F "downloadRegion=${DOWNLOAD_REGION}"
+        )
+
+        add_form() {
+          local key="$1"
+          local value="$2"
+          if [ -n "$value" ]; then
+            args+=(-F "${key}=${value}")
+          fi
+        }
+
+        add_form packageName "$PACKAGE_NAME"
+        add_form appName "$APP_NAME"
+        add_form activityName "$ACTIVITY_NAME"
+        add_form versionName "$VERSION_NAME"
+        add_form versionCode "$VERSION_CODE"
+        add_form architecture "$ARCHITECTURE"
+        add_form notes "$NOTES"
+
+        set +e
+        http_code=$(curl "${args[@]}" -o "$response_file" -w "%{http_code}")
+        curl_status=$?
+        set -e
+
+        cat "$response_file"
+        echo
+
+        if [ "$curl_status" -ne 0 ]; then
+          echo "curl failed with status $curl_status" >&2
+          exit "$curl_status"
+        fi
+        case "$http_code" in
+          2*) ;;
+          *)
+            echo "Backend returned HTTP $http_code" >&2
+            exit 1
+            ;;
+        esac
+
+        echo "response-file=$response_file" >> "$GITHUB_OUTPUT"
+        release_id=$(python3 - "$response_file" <<'PY' 2>/dev/null || true
+        import json
+        import sys
+        with open(sys.argv[1], "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        print(payload.get("data", {}).get("release", {}).get("id", ""))
+        PY
+        )
+        if [ -n "$release_id" ]; then
+          echo "release-id=$release_id" >> "$GITHUB_OUTPUT"
+        fi
