@@ -6,7 +6,7 @@ Upload an APK/APKS/XAPK to `tbe_go`, let the backend inspect package metadata, u
 
 ```yaml
 - name: Publish Toooony package
-  uses: https://git.toooony.com/actions/toooony-store-publish@v0.1.0
+  uses: https://git.toooony.com/actions/toooony-store-publish@main
   with:
     backend-url: ${{ secrets.BACKEND_API_URL }}
     backend-token: ${{ secrets.TOOOONY_STORE_PUBLISH_TOKEN }}
@@ -17,7 +17,7 @@ Upload an APK/APKS/XAPK to `tbe_go`, let the backend inspect package metadata, u
 
 ```yaml
 - name: Publish Launcher
-  uses: https://git.toooony.com/actions/toooony-store-publish@v0.1.0
+  uses: https://git.toooony.com/actions/toooony-store-publish@main
   with:
     backend-url: ${{ secrets.BACKEND_API_URL }}
     backend-token: ${{ secrets.TOOOONY_STORE_PUBLISH_TOKEN }}
