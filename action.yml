@@ -63,6 +63,22 @@ inputs:
     description: Region key for legacy catalog download URL
     required: false
     default: global
+  upload-mode:
+    description: Upload mode. auto uses multipart above multipart-threshold; direct always posts multipart/form-data; multipart always uses object multipart upload.
+    required: false
+    default: auto
+  multipart-threshold:
+    description: File size threshold in bytes for auto multipart upload.
+    required: false
+    default: "67108864"
+  multipart-part-size:
+    description: Requested multipart part size in bytes. Backend may raise it to satisfy provider limits.
+    required: false
+    default: "16777216"
+  multipart-concurrency:
+    description: Number of multipart parts to upload in parallel.
+    required: false
+    default: "4"
 
 outputs:
   response-file:
@@ -94,6 +110,10 @@ runs:
         UPDATE_CATALOG: ${{ inputs.update-catalog }}
         CATALOG_ENABLED: ${{ inputs.catalog-enabled }}
         DOWNLOAD_REGION: ${{ inputs.download-region }}
+        UPLOAD_MODE: ${{ inputs.upload-mode }}
+        MULTIPART_THRESHOLD: ${{ inputs.multipart-threshold }}
+        MULTIPART_PART_SIZE: ${{ inputs.multipart-part-size }}
+        MULTIPART_CONCURRENCY: ${{ inputs.multipart-concurrency }}
       run: |
         set -euo pipefail
 
@@ -111,16 +131,120 @@ runs:
         fi
 
         backend="${BACKEND_URL%/}"
-        url="${backend}/api/v1/admin/store/packages/publish/cicd"
+        publish_url="${backend}/api/v1/admin/store/packages/publish/cicd"
+        upload_base_url="${backend}/api/v1/admin/store/packages/upload/cicd"
         response_file="${RUNNER_TEMP:-.}/toooony-store-publish-response.json"
+        package_file_name="$(basename "$PACKAGE_FILE")"
+        package_size="$(stat -c%s "$PACKAGE_FILE" 2>/dev/null || wc -c < "$PACKAGE_FILE" | tr -d ' ')"
 
-        args=(
+        if ! command -v python3 >/dev/null 2>&1; then
+          echo "python3 is required" >&2
+          exit 1
+        fi
+
+        require_uint() {
+          local name="$1"
+          local value="$2"
+          if ! echo "$value" | grep -Eq '^[0-9]+$'; then
+            echo "${name} must be a non-negative integer, got: ${value}" >&2
+            exit 1
+          fi
+        }
+
+        require_uint multipart-threshold "$MULTIPART_THRESHOLD"
+        require_uint multipart-part-size "$MULTIPART_PART_SIZE"
+        require_uint multipart-concurrency "$MULTIPART_CONCURRENCY"
+        if [ "$MULTIPART_CONCURRENCY" -lt 1 ]; then
+          MULTIPART_CONCURRENCY=1
+        fi
+
+        curl_api_common=(
           -sS
+          --retry 5
+          --retry-delay 2
+          --retry-all-errors
+          --connect-timeout 30
+        )
+
+        curl_post_common=(
+          "${curl_api_common[@]}"
           -L
           --post301
           --post302
           --post303
-          -X POST "$url"
+        )
+
+        check_http_response() {
+          local http_code="$1"
+          local curl_status="$2"
+          local out_file="$3"
+          if [ "$curl_status" -ne 0 ]; then
+            if [ -s "$out_file" ]; then cat "$out_file" >&2; fi
+            echo "curl failed with status $curl_status" >&2
+            exit "$curl_status"
+          fi
+          case "$http_code" in
+            2*) ;;
+            *)
+              if [ -s "$out_file" ]; then cat "$out_file" >&2; fi
+              echo "Backend returned HTTP $http_code" >&2
+              exit 1
+              ;;
+          esac
+        }
+
+        post_json() {
+          local endpoint="$1"
+          local body_file="$2"
+          local out_file="$3"
+          set +e
+          local http_code
+          http_code=$(curl "${curl_post_common[@]}" \
+            -X POST "$endpoint" \
+            -H "Authorization: Bearer ${BACKEND_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary "@${body_file}" \
+            -o "$out_file" \
+            -w "%{http_code}")
+          local curl_status=$?
+          set -e
+          check_http_response "$http_code" "$curl_status" "$out_file"
+        }
+
+        json_get() {
+          local file="$1"
+          local path="$2"
+          python3 - "$file" "$path" <<'PY'
+        import json
+        import sys
+        with open(sys.argv[1], "r", encoding="utf-8") as f:
+            value = json.load(f)
+        for part in sys.argv[2].split("."):
+            value = value[part]
+        print(value)
+        PY
+        }
+
+        calculate_hashes() {
+          python3 - "$PACKAGE_FILE" <<'PY'
+        import hashlib
+        import sys
+        md5 = hashlib.md5()
+        sha1 = hashlib.sha1()
+        sha256 = hashlib.sha256()
+        with open(sys.argv[1], "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                md5.update(chunk)
+                sha1.update(chunk)
+                sha256.update(chunk)
+        print(md5.hexdigest(), sha1.hexdigest(), sha256.hexdigest())
+        PY
+        }
+
+        publish_direct() {
+          local args=(
+            "${curl_post_common[@]}"
+          -X POST "$publish_url"
           -H "Authorization: Bearer ${BACKEND_TOKEN}"
           -F "file=@${PACKAGE_FILE}"
           -F "platform=${PLATFORM}"
@@ -129,43 +253,238 @@ runs:
           -F "updateCatalog=${UPDATE_CATALOG}"
           -F "catalogEnabled=${CATALOG_ENABLED}"
           -F "downloadRegion=${DOWNLOAD_REGION}"
-        )
+          )
 
-        add_form() {
-          local key="$1"
-          local value="$2"
-          if [ -n "$value" ]; then
-            args+=(-F "${key}=${value}")
-          fi
+          add_form() {
+            local key="$1"
+            local value="$2"
+            if [ -n "$value" ]; then
+              args+=(-F "${key}=${value}")
+            fi
+          }
+
+          add_form packageName "$PACKAGE_NAME"
+          add_form appName "$APP_NAME"
+          add_form activityName "$ACTIVITY_NAME"
+          add_form versionName "$VERSION_NAME"
+          add_form versionCode "$VERSION_CODE"
+          add_form architecture "$ARCHITECTURE"
+          add_form notes "$NOTES"
+
+          set +e
+          local http_code
+          http_code=$(curl "${args[@]}" -o "$response_file" -w "%{http_code}")
+          local curl_status=$?
+          set -e
+          check_http_response "$http_code" "$curl_status" "$response_file"
         }
 
-        add_form packageName "$PACKAGE_NAME"
-        add_form appName "$APP_NAME"
-        add_form activityName "$ACTIVITY_NAME"
-        add_form versionName "$VERSION_NAME"
-        add_form versionCode "$VERSION_CODE"
-        add_form architecture "$ARCHITECTURE"
-        add_form notes "$NOTES"
+        write_publish_json() {
+          local out_file="$1"
+          local storage_key="$2"
+          local md5="$3"
+          local sha1="$4"
+          local sha256="$5"
+          STORAGE_KEY="$storage_key" PACKAGE_MD5="$md5" PACKAGE_SHA1="$sha1" PACKAGE_SHA256="$sha256" \
+          python3 <<'PY' > "$out_file"
+        import json
+        import os
 
-        set +e
-        http_code=$(curl "${args[@]}" -o "$response_file" -w "%{http_code}")
-        curl_status=$?
-        set -e
+        def truthy(value):
+            return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-        cat "$response_file"
-        echo
+        def add_if_present(target, key, env_name):
+            value = os.environ.get(env_name, "").strip()
+            if value:
+                target[key] = value
 
-        if [ "$curl_status" -ne 0 ]; then
-          echo "curl failed with status $curl_status" >&2
-          exit "$curl_status"
-        fi
-        case "$http_code" in
-          2*) ;;
+        data = {
+            "storageKey": os.environ["STORAGE_KEY"],
+            "fileName": os.environ["PACKAGE_FILE_NAME"],
+            "fileSize": int(os.environ["PACKAGE_SIZE"]),
+            "platform": os.environ.get("PLATFORM", "android"),
+            "artifactType": os.environ.get("ARTIFACT_TYPE", "apk"),
+            "isActive": truthy(os.environ.get("IS_ACTIVE", "true")),
+            "updateCatalog": truthy(os.environ.get("UPDATE_CATALOG", "true")),
+            "catalogEnabled": truthy(os.environ.get("CATALOG_ENABLED", "true")),
+            "downloadRegion": os.environ.get("DOWNLOAD_REGION", "global"),
+        }
+        add_if_present(data, "packageName", "PACKAGE_NAME")
+        add_if_present(data, "appName", "APP_NAME")
+        add_if_present(data, "activityName", "ACTIVITY_NAME")
+        add_if_present(data, "versionName", "VERSION_NAME")
+        add_if_present(data, "architecture", "ARCHITECTURE")
+        add_if_present(data, "notes", "NOTES")
+        add_if_present(data, "md5", "PACKAGE_MD5")
+        add_if_present(data, "sha1", "PACKAGE_SHA1")
+        add_if_present(data, "sha256", "PACKAGE_SHA256")
+        version_code = os.environ.get("VERSION_CODE", "").strip()
+        if version_code:
+            data["versionCode"] = int(version_code)
+        print(json.dumps(data, ensure_ascii=False))
+        PY
+        }
+
+        publish_multipart() {
+          local temp_dir
+          temp_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/toooony-store-upload.XXXXXX")"
+          local upload_id=""
+          local storage_key=""
+          cleanup() {
+            rm -rf "$temp_dir"
+          }
+          trap cleanup EXIT
+
+          read -r package_md5 package_sha1 package_sha256 < <(calculate_hashes)
+
+          local init_body="${temp_dir}/init.json"
+          local init_response="${temp_dir}/init-response.json"
+          PACKAGE_SHA256="$package_sha256" python3 <<'PY' > "$init_body"
+        import json
+        import os
+        data = {
+            "fileName": os.environ["PACKAGE_FILE_NAME"],
+            "fileSize": int(os.environ["PACKAGE_SIZE"]),
+            "partSize": int(os.environ["MULTIPART_PART_SIZE"]),
+            "sha256": os.environ.get("PACKAGE_SHA256", ""),
+        }
+        print(json.dumps(data))
+        PY
+          post_json "${upload_base_url}/init" "$init_body" "$init_response"
+          storage_key="$(json_get "$init_response" data.key)"
+          upload_id="$(json_get "$init_response" data.uploadId)"
+          local part_size
+          part_size="$(json_get "$init_response" data.partSize)"
+          local part_count
+          part_count="$(json_get "$init_response" data.partCount)"
+
+          abort_upload() {
+            if [ -n "$upload_id" ] && [ -n "$storage_key" ]; then
+              local abort_body="${temp_dir}/abort.json"
+              local abort_response="${temp_dir}/abort-response.json"
+              STORAGE_KEY="$storage_key" UPLOAD_ID="$upload_id" python3 <<'PY' > "$abort_body"
+        import json
+        import os
+        print(json.dumps({"key": os.environ["STORAGE_KEY"], "uploadId": os.environ["UPLOAD_ID"]}))
+        PY
+              post_json "${upload_base_url}/abort" "$abort_body" "$abort_response" || true
+            fi
+          }
+
+          upload_part() {
+            local part_number="$1"
+            local part_url="$2"
+            local part_file="${temp_dir}/part-${part_number}"
+            dd if="$PACKAGE_FILE" of="$part_file" bs="$part_size" skip=$((part_number - 1)) count=1 iflag=fullblock status=none
+            set +e
+            curl "${curl_api_common[@]}" --fail -X PUT --upload-file "$part_file" "$part_url" -o /dev/null
+            local status=$?
+            set -e
+            rm -f "$part_file"
+            return "$status"
+          }
+
+          local running=0
+          local failures=0
+          local batch_start=1
+          while [ "$batch_start" -le "$part_count" ]; do
+            local batch_end=$((batch_start + 199))
+            if [ "$batch_end" -gt "$part_count" ]; then
+              batch_end="$part_count"
+            fi
+            local parts_body="${temp_dir}/parts-${batch_start}.json"
+            local parts_response="${temp_dir}/parts-${batch_start}-response.json"
+            STORAGE_KEY="$storage_key" UPLOAD_ID="$upload_id" PART_START="$batch_start" PART_END="$batch_end" python3 <<'PY' > "$parts_body"
+        import json
+        import os
+        start = int(os.environ["PART_START"])
+        end = int(os.environ["PART_END"])
+        print(json.dumps({
+            "key": os.environ["STORAGE_KEY"],
+            "uploadId": os.environ["UPLOAD_ID"],
+            "partNumbers": list(range(start, end + 1)),
+        }))
+        PY
+            post_json "${upload_base_url}/parts" "$parts_body" "$parts_response"
+
+            while IFS=$'\t' read -r part_number part_url; do
+              upload_part "$part_number" "$part_url" &
+              running=$((running + 1))
+              if [ "$running" -ge "$MULTIPART_CONCURRENCY" ]; then
+                if ! wait -n; then
+                  failures=$((failures + 1))
+                fi
+                running=$((running - 1))
+              fi
+            done < <(python3 - "$parts_response" <<'PY'
+        import json
+        import sys
+        with open(sys.argv[1], "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        for part in payload["data"]["parts"]:
+            print(f'{part["partNumber"]}\t{part["url"]}')
+        PY
+        )
+            batch_start=$((batch_end + 1))
+          done
+
+          while [ "$running" -gt 0 ]; do
+            if ! wait -n; then
+              failures=$((failures + 1))
+            fi
+            running=$((running - 1))
+          done
+          if [ "$failures" -gt 0 ]; then
+            abort_upload
+            echo "${failures} multipart part upload(s) failed" >&2
+            exit 1
+          fi
+
+          local complete_body="${temp_dir}/complete.json"
+          local complete_response="${temp_dir}/complete-response.json"
+          STORAGE_KEY="$storage_key" UPLOAD_ID="$upload_id" PART_COUNT="$part_count" python3 <<'PY' > "$complete_body"
+        import json
+        import os
+        print(json.dumps({
+            "key": os.environ["STORAGE_KEY"],
+            "uploadId": os.environ["UPLOAD_ID"],
+            "partCount": int(os.environ["PART_COUNT"]),
+        }))
+        PY
+          post_json "${upload_base_url}/complete" "$complete_body" "$complete_response"
+
+          local publish_body="${temp_dir}/publish.json"
+          PACKAGE_FILE_NAME="$package_file_name" PACKAGE_SIZE="$package_size" write_publish_json "$publish_body" "$storage_key" "$package_md5" "$package_sha1" "$package_sha256"
+          post_json "$publish_url" "$publish_body" "$response_file"
+          cleanup
+          trap - EXIT
+        }
+
+        export PACKAGE_FILE_NAME="$package_file_name"
+        export PACKAGE_SIZE="$package_size"
+
+        case "$UPLOAD_MODE" in
+          direct)
+            publish_direct
+            ;;
+          multipart)
+            publish_multipart
+            ;;
+          auto)
+            if [ "$package_size" -ge "$MULTIPART_THRESHOLD" ]; then
+              publish_multipart
+            else
+              publish_direct
+            fi
+            ;;
           *)
-            echo "Backend returned HTTP $http_code" >&2
+            echo "upload-mode must be one of auto, direct, multipart; got: ${UPLOAD_MODE}" >&2
             exit 1
             ;;
         esac
+
+        cat "$response_file"
+        echo
 
         echo "response-file=$response_file" >> "$GITHUB_OUTPUT"
         release_id=$(python3 - "$response_file" <<'PY' 2>/dev/null || true
